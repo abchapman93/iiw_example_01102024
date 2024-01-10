@@ -1,0 +1,108 @@
+---
+title: "Inverse intensity model"
+format: html
+editor: visual
+---
+
+```{r}
+library(IrregLong)
+library(MEMSS)
+library(dplyr)
+library(survival)
+library(geepack)
+```
+
+This is adapted from examples in the documentation for the package [IrregLong](https://epullenayegum.github.io/IrregLong/articles/Irreglong-vignette.html). These examples use the `Phenobarb` dataset:
+
+```{r}
+str(Phenobarb)
+```
+
+First we'll preprocess the data a bit. `event` will denote whether the outcome was measured for the subject on that day.
+
+```{r}
+data = mutate(Phenobarb, event=1-(is.na(Phenobarb$conc))) %>%
+  # Filter to rows where the outcome was measured
+  filter(event==1) %>%
+  mutate(Subject=as.numeric(Subject)) %>%
+  rename(id=Subject) %>%
+  # Limit to a fixed follow up time
+  filter(time<16*24) %>%
+  arrange(id, time) %>%
+  select(-dose)
+
+head(data)
+```
+
+Helper function in `IrregLong` to plot visits:
+
+```{r}
+abacus.plot(n=25, time="time", id="id", data=data, tmin=0, tmax=16*24)
+```
+
+Next we'll add a lagged variable and time. In the example for this package, the first blood draw is set to be 0 and the time is set to 0.
+
+```{r}
+data = data %>%
+  group_by(id) %>%
+  mutate(time.lag=lag(time), conc.lag=lag(conc)) %>%
+  ungroup()
+
+data[is.na(data$time.lag),c("time.lag", "conc.lag")] = 0
+
+head(data)
+```
+
+Now add rows for censoring using a helper function from \`IrregLong\`. In this dataset that's defined to be a fixed time, but this might be different for different patients in other analyses. In that case, you would need to define the follow-up time for each patient. But here we'll just define it as 16 days (measured in hours):
+
+```{r}
+get_maxfu = function(data, maxtime=16*24){
+  data %>% 
+    distinct(id) %>%
+    mutate(maxfu = maxtime) %>%
+    arrange(id)
+}
+
+maxfu=get_maxfu(data)
+head(maxfu)
+```
+
+Now add rows at that time to censor each patient - these will have `event=0` .
+
+```{r}
+data = addcensoredrows(as.data.frame(data), maxfu=maxfu, id="id", time="time", event="event",
+                tinvarcols = which(colnames(data) == "id")  # Index for columns that don't vary with time
+                )
+
+head(data)
+```
+
+Now fit a Cox proportional hazards model.
+
+```{r}
+iiw_model = coxph(Surv(time.lag, time, event) ~ Wt + ApgarInd + I(conc.lag>0 & conc.lag<=20) + I(conc.lag>20 & conc.lag<=30) + I(conc.lag>30),
+                id=id, data=data)
+
+summary(iiw_model)
+```
+
+Now we can add the weights to the data. We'll filter the data to the rows with an event and exclude the censoring rows.
+
+```{r}
+visits = filter(data, event==1)
+hr = predict(iiw_model, newdata=visits, type="lp")
+visits$iiw = exp(-hr)
+
+hist(visits$iiw)
+```
+
+Now we'll fit the outcome model.
+
+```{r}
+outcome_model = geeglm(conc ~ time + I(time^3) + log(time), data=visits,
+                       weights=visits$iiw,
+                       family=gaussian(),
+                       id=id)
+
+summary(outcome_model)
+```
